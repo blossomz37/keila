@@ -114,6 +114,31 @@ defmodule Keila.Mailings.H1CampaignPreparationTest do
     refute Repo.exists?(AuditEvent)
   end
 
+  test "a selected segment with empty criteria rolls preparation back", %{
+    project: project,
+    sender: sender
+  } do
+    insert!(:contact, project_id: project.id)
+    segment = insert!(:contacts_segment, project_id: project.id, filter: %{})
+    campaign = campaign_fixture(project, sender, segment_id: segment.id)
+
+    assert {:error, :empty_audience_criteria} =
+             Mailings.prepare_campaign(
+               campaign.id,
+               %{},
+               campaign.revision,
+               future_time(),
+               mode: :scheduled
+             )
+
+    assert %{revision: 1, state: :draft, active_snapshot_id: nil} =
+             Mailings.get_campaign(campaign.id)
+
+    refute Repo.exists?(CampaignSnapshot)
+    refute Repo.exists?(Message)
+    refute Repo.exists?(AuditEvent)
+  end
+
   test "repeating the same preparation request is idempotent", %{
     project: project,
     sender: sender
@@ -157,9 +182,17 @@ defmodule Keila.Mailings.H1CampaignPreparationTest do
         email: "original@example.org"
       )
 
+    template =
+      insert!(:template,
+        project_id: project.id,
+        type: :text,
+        text_body: "Template Original {{ contact.first_name }}"
+      )
+
     campaign =
       campaign_fixture(project, sender,
-        text_body: "Hello {{ contact.first_name }}",
+        template_id: template.id,
+        text_body: nil,
         subject: "Original subject"
       )
 
@@ -181,6 +214,12 @@ defmodule Keila.Mailings.H1CampaignPreparationTest do
     )
     |> Repo.update_all([])
 
+    from(t in Keila.Templates.Template,
+      where: t.id == ^template.id,
+      update: [set: [text_body: "Template Mutated {{ contact.first_name }}"]]
+    )
+    |> Repo.update_all([])
+
     {:ok, _contact} =
       Contacts.update_contact(contact.id, %{
         first_name: "Mutated",
@@ -192,7 +231,8 @@ defmodule Keila.Mailings.H1CampaignPreparationTest do
     message = Repo.one!(Message)
     assert message.status == :ready
     assert message.subject == "Original subject"
-    assert message.text_body =~ "Hello Original"
+    assert message.text_body =~ "Template Original Original"
+    refute message.text_body =~ "Template Mutated"
     assert message.recipient_email == "original@example.org"
     assert Mailings.get_campaign(prepared.id).render_ready_at
   end

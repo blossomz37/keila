@@ -828,6 +828,13 @@ defmodule Keila.Mailings do
     end
   end
 
+  defp campaign_audience_filter(%Campaign{segment: %{filter: nil}}),
+    do: Repo.rollback(:empty_audience_criteria)
+
+  defp campaign_audience_filter(%Campaign{segment: %{filter: filter}})
+       when is_map(filter) and map_size(filter) == 0,
+       do: Repo.rollback(:empty_audience_criteria)
+
   defp campaign_audience_filter(campaign) do
     segment_filter = if campaign.segment, do: campaign.segment.filter, else: %{}
     %{"$and" => [segment_filter, %{"status" => "active"}]}
