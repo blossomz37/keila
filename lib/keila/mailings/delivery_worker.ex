@@ -1,6 +1,7 @@
 defmodule Keila.Mailings.DeliveryWorker do
   use Oban.Worker,
     queue: :mailer,
+    max_attempts: 1,
     unique: [
       period: :infinity,
       states: [:available, :scheduled, :executing],
@@ -14,10 +15,12 @@ defmodule Keila.Mailings.DeliveryWorker do
   alias Keila.EmailAddress
   alias Keila.EmailHeader
   alias Keila.Contacts.Contact
-  alias Keila.Mailings.Message
+  alias Keila.Mailings.{Delivery, DeliveryAttempt, Message}
 
   @impl true
-  def perform(%Oban.Job{args: %{"message_id" => id}}) do
+  def perform(%Oban.Job{args: %{"message_id" => id} = args}) do
+    claim_token = args["claim_token"]
+
     message =
       from(m in Message,
         where: m.id == ^id and m.status == :queued,
@@ -27,16 +30,15 @@ defmodule Keila.Mailings.DeliveryWorker do
 
     with :ok <- ensure_message(message),
          :ok <- ensure_sender(message.sender),
-         {:ok, email} <- email_from_message(message) do
-      Keila.Mailer.deliver_with_sender(email, message.sender)
+         {:ok, email} <- email_from_message(message),
+         {:ok, attempting, attempt} <- Delivery.begin_attempt(id, claim_token) do
+      deliver_attempt(email, attempting, attempt)
     end
-    |> then(fn result -> handle_result(result, message) end)
+    |> then(fn result -> handle_pre_attempt_result(result, message) end)
   rescue
     e ->
-      set_message_failed(%Message{id: id})
-
       Logger.error(
-        "DeliveryWorker: Unhandled exception for message #{id}: #{Exception.message(e)}"
+        "DeliveryWorker: Unhandled pre-attempt exception for message #{id}: #{Exception.message(e)}"
       )
 
       {:cancel, :exception}
@@ -47,6 +49,19 @@ defmodule Keila.Mailings.DeliveryWorker do
 
   defp ensure_sender(%Keila.Mailings.Sender{}), do: :ok
   defp ensure_sender(_), do: {:error, :no_sender}
+
+  defp deliver_attempt(email, message, %DeliveryAttempt{} = attempt) do
+    result =
+      try do
+        Keila.Mailer.deliver_with_sender(email, message.sender)
+      rescue
+        error -> {:uncertain, Exception.message(error)}
+      catch
+        kind, reason -> {:uncertain, "#{kind}: #{inspect(reason)}"}
+      end
+
+    handle_delivery_result(result, message, attempt)
+  end
 
   defp email_from_message(message) do
     Swoosh.Email.new()
@@ -148,71 +163,61 @@ defmodule Keila.Mailings.DeliveryWorker do
     end)
   end
 
-  # Email was sent successfully
-  defp handle_result({:ok, raw_receipt}, message) do
-    receipt = get_receipt(raw_receipt)
-    set_message_sent(message, receipt)
-
+  defp handle_delivery_result({:ok, raw_receipt}, _message, attempt) do
+    :ok = Delivery.accept_attempt(attempt.id, raw_receipt)
     :ok
   end
 
-  # Invalid contact (e.g. unsubscribed or deleted)
-  defp handle_result({:error, :invalid_contact}, message) do
+  defp handle_delivery_result({:error, :invalid_email}, message, attempt) do
+    :ok = Delivery.reject_attempt(attempt.id, :invalid_email)
+    maybe_set_contact_unreachable(message)
+    {:cancel, :invalid_email}
+  end
+
+  defp handle_delivery_result({:error, reason}, message, attempt) do
+    Logger.warning(
+      "DeliveryWorker: Ambiguous provider result for message #{message.id} in campaign #{message.campaign_id}: #{inspect(reason)}"
+    )
+
+    :ok = Delivery.mark_attempt_uncertain(attempt.id, reason)
+    {:cancel, :uncertain}
+  end
+
+  defp handle_delivery_result({:uncertain, reason}, message, attempt) do
+    Logger.warning(
+      "DeliveryWorker: Provider call raised for message #{message.id} in campaign #{message.campaign_id}: #{reason}"
+    )
+
+    :ok = Delivery.mark_attempt_uncertain(attempt.id, reason)
+    {:cancel, :uncertain}
+  end
+
+  defp handle_pre_attempt_result(:ok, _message), do: :ok
+
+  defp handle_pre_attempt_result({:suppressed, _message}, _loaded_message),
+    do: {:cancel, :suppressed}
+
+  # Invalid contact data is rejected before an attempt begins.
+  defp handle_pre_attempt_result({:error, :invalid_contact}, message) do
     Repo.transaction(fn ->
-      message
-      |> tap(&set_message_failed/1)
-      |> tap(&maybe_set_contact_unreachable/1)
+      set_message_failed(message)
+      maybe_set_contact_unreachable(message)
     end)
 
     {:cancel, :invalid_contact}
   end
 
-  # Invalid email address (returned by Keila.Mailer)
-  defp handle_result({:error, :invalid_email}, message) do
-    Repo.transaction(fn ->
-      message
-      |> tap(&set_message_failed/1)
-      |> tap(&maybe_set_contact_unreachable/1)
-    end)
-
-    {:cancel, :invalid_email}
-  end
-
   # Message not found (e.g. deleted or already processed)
-  defp handle_result({:error, :not_found}, nil), do: {:cancel, :not_found}
+  defp handle_pre_attempt_result({:error, :not_found}, nil), do: {:cancel, :not_found}
 
   # Sender not found
-  defp handle_result({:error, :no_sender}, nil), do: {:cancel, :no_sender}
+  defp handle_pre_attempt_result({:error, :no_sender}, nil), do: {:cancel, :no_sender}
 
-  # Another error occurred. Sending is not retried.
-  defp handle_result({:error, reason}, message) do
-    Logger.warning(
-      "DeliveryWorker: Failed sending email to #{message.recipient_email} for campaign #{message.campaign_id}: #{inspect(reason)}"
-    )
-
-    set_message_failed(message)
-
-    {:cancel, reason}
-  end
-
-  defp set_message_sent(message, receipt) do
-    from(m in Message,
-      where: m.id == ^message.id,
-      update: [
-        set: [
-          sent_at: fragment("NOW()"),
-          status: :sent,
-          receipt: ^receipt,
-          updated_at: fragment("NOW()")
-        ]
-      ]
-    )
-    |> Repo.update_all([])
-  end
+  defp handle_pre_attempt_result({:error, reason}, _message), do: {:cancel, reason}
 
   defp set_message_failed(message) do
     from(m in Message,
-      where: m.id == ^message.id,
+      where: m.id == ^message.id and m.status == :queued,
       update: [
         set: [
           status: :failed,
@@ -238,8 +243,4 @@ defmodule Keila.Mailings.DeliveryWorker do
   end
 
   defp maybe_set_contact_unreachable(_other), do: :ok
-
-  defp get_receipt(%{id: receipt}), do: receipt
-  defp get_receipt(receipt) when is_binary(receipt), do: receipt
-  defp get_receipt(_), do: nil
 end

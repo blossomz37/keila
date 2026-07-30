@@ -26,7 +26,7 @@ defmodule Keila.Hardening.H0SafetyRegressionsTest do
 
   alias Keila.Hardening.AcceptThenCrashAdapter
   alias Keila.{Contacts, Mailings, Projects, Repo}
-  alias Keila.Mailings.{DeliveryWorker, Message}
+  alias Keila.Mailings.{DeliveryAttempt, DeliveryWorker, Message, StaleDeliveryAttemptsWorker}
 
   @moduletag :h0_safety_red
 
@@ -138,11 +138,17 @@ defmodule Keila.Hardening.H0SafetyRegressionsTest do
 
     assert_receive {:h0_provider_accepted, 1, _email}
     assert_receive {:DOWN, ^monitor, :process, ^worker, :killed}
-    assert Repo.reload(message).status == :queued
+    assert Repo.reload(message).status == :attempting
+    assert Repo.one!(DeliveryAttempt).state == :in_flight
 
-    assert :ok = DeliveryWorker.perform(job)
-    assert_receive {:h0_provider_accepted, 2, _email}
+    assert :ok =
+             StaleDeliveryAttemptsWorker.perform(%Oban.Job{
+               args: %{"stale_after_seconds" => 0}
+             })
 
+    assert Repo.reload(message).status == :uncertain
+    assert {:cancel, :not_found} = DeliveryWorker.perform(job)
+    refute_receive {:h0_provider_accepted, 2, _email}
     provider_calls = :ets.lookup_element(table, :provider_calls, 2)
     final_status = Repo.reload(message).status
 

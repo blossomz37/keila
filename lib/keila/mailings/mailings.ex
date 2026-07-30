@@ -1216,6 +1216,16 @@ defmodule Keila.Mailings do
   end
 
   @doc """
+  Creates a durable project suppression and atomically suppresses matching
+  pending campaign messages.
+  """
+  @spec suppress_identity(Project.id(), String.t(), Keyword.t()) ::
+          {:ok, Keila.Mailings.ContactSuppression.t()} | {:error, term()}
+  def suppress_identity(project_id, email, opts \\ []) do
+    Keila.Mailings.Delivery.suppress_identity(project_id, email, opts)
+  end
+
+  @doc """
   Updates a message it was opened for the first time and logs the event.
   """
   @spec handle_message_open(Message.id(), Keyword.t()) :: :ok

@@ -14,7 +14,16 @@ defmodule Keila.Mailings.Scheduler do
   require Logger
   import Ecto.Query
 
-  alias Keila.Mailings.{Campaign, Message, RateLimiter, Sender, SenderAdapters}
+  alias Keila.Contacts.Contact
+
+  alias Keila.Mailings.{
+    Campaign,
+    ContactSuppression,
+    Message,
+    RateLimiter,
+    Sender,
+    SenderAdapters
+  }
 
   @lock_id 3114
   @max_partition_tokens 500
@@ -246,12 +255,15 @@ defmodule Keila.Mailings.Scheduler do
   defp insert_delivery_job(sender) do
     Keila.Repo.transact(fn ->
       case set_next_message_queued(sender) do
-        {0, _} ->
+        {0, _, _claim_token} ->
           Logger.debug("No message ready for sender #{sender.id}")
           {:error, :error}
 
-        {1, [message_id]} ->
-          Keila.Mailings.DeliveryWorker.new(%{"message_id" => message_id})
+        {1, [message_id], claim_token} ->
+          Keila.Mailings.DeliveryWorker.new(%{
+            "message_id" => message_id,
+            "claim_token" => claim_token
+          })
           |> Oban.insert!()
 
           Logger.debug("Inserted delivery job for sender #{sender.id}: message #{message_id}")
@@ -266,15 +278,25 @@ defmodule Keila.Mailings.Scheduler do
 
   defp set_next_message_queued(sender) do
     message_id = next_message_id_query(sender)
+    claim_token = Ecto.UUID.generate()
 
-    from(m in Message,
-      where: m.id in subquery(message_id),
-      update: [
-        set: [status: :queued, queued_at: fragment("NOW()"), updated_at: fragment("NOW()")]
-      ],
-      select: m.id
-    )
-    |> Repo.update_all([])
+    {count, message_ids} =
+      from(m in Message,
+        where: m.id in subquery(message_id),
+        update: [
+          set: [
+            status: :queued,
+            claim_token: ^claim_token,
+            queued_at: fragment("NOW()"),
+            claimed_at: fragment("NOW()"),
+            updated_at: fragment("NOW()")
+          ]
+        ],
+        select: m.id
+      )
+      |> Repo.update_all([])
+
+    {count, message_ids, claim_token}
   end
 
   defp next_message_id_query(sender) do
@@ -290,6 +312,22 @@ defmodule Keila.Mailings.Scheduler do
                   not is_nil(c.render_ready_at)
             )
           ),
+      where:
+        is_nil(m.campaign_snapshot_id) or
+          (exists(
+             from(c in Contact,
+               where: c.id == parent_as(:message).contact_id and c.status == :active
+             )
+           ) and
+             not exists(
+               from(s in ContactSuppression,
+                 where:
+                   s.project_id == parent_as(:message).project_id and is_nil(s.ended_at) and
+                     (s.contact_id == parent_as(:message).contact_id or
+                        fragment("lower(?)", s.email_identity) ==
+                          fragment("lower(?)", parent_as(:message).recipient_email))
+               )
+             )),
       order_by: [asc: :priority, asc: :inserted_at],
       limit: 1,
       lock: "FOR UPDATE SKIP LOCKED",
@@ -302,15 +340,31 @@ defmodule Keila.Mailings.Scheduler do
       from(m in Message,
         as: :message,
         where: m.sender_id == parent_as(:sender).id and m.status == :ready,
-        where:
-          is_nil(m.campaign_snapshot_id) or
-            exists(
+      where:
+        is_nil(m.campaign_snapshot_id) or
+          exists(
               from(c in Campaign,
                 where:
                   c.id == parent_as(:message).campaign_id and c.state == :sending and
-                    not is_nil(c.render_ready_at)
-              )
+                  not is_nil(c.render_ready_at)
             )
+          ),
+      where:
+        is_nil(m.campaign_snapshot_id) or
+          (exists(
+             from(c in Contact,
+               where: c.id == parent_as(:message).contact_id and c.status == :active
+             )
+           ) and
+             not exists(
+               from(s in ContactSuppression,
+                 where:
+                   s.project_id == parent_as(:message).project_id and is_nil(s.ended_at) and
+                     (s.contact_id == parent_as(:message).contact_id or
+                        fragment("lower(?)", s.email_identity) ==
+                          fragment("lower(?)", parent_as(:message).recipient_email))
+               )
+             ))
       )
 
     senders =
@@ -338,7 +392,8 @@ defmodule Keila.Mailings.Scheduler do
 
     too_many_queued =
       from(m in Message,
-        where: m.sender_id == parent_as(:sc).sender_id and m.status == :queued,
+        where:
+          m.sender_id == parent_as(:sc).sender_id and m.status in [:queued, :attempting],
         offset: parent_as(:sc).capacity - 1,
         limit: 1
       )
