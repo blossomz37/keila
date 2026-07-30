@@ -14,10 +14,7 @@ defmodule Keila.Mailings.Scheduler do
   require Logger
   import Ecto.Query
 
-  alias Keila.Mailings.Message
-  alias Keila.Mailings.Sender
-  alias Keila.Mailings.SenderAdapters
-  alias Keila.Mailings.RateLimiter
+  alias Keila.Mailings.{Campaign, Message, RateLimiter, Sender, SenderAdapters}
 
   @lock_id 3114
   @max_partition_tokens 500
@@ -282,7 +279,17 @@ defmodule Keila.Mailings.Scheduler do
 
   defp next_message_id_query(sender) do
     from(m in Message,
+      as: :message,
       where: m.sender_id == ^sender.id and m.status == :ready,
+      where:
+        is_nil(m.campaign_snapshot_id) or
+          exists(
+            from(c in Campaign,
+              where:
+                c.id == parent_as(:message).campaign_id and c.state == :sending and
+                  not is_nil(c.render_ready_at)
+            )
+          ),
       order_by: [asc: :priority, asc: :inserted_at],
       limit: 1,
       lock: "FOR UPDATE SKIP LOCKED",
@@ -292,7 +299,19 @@ defmodule Keila.Mailings.Scheduler do
 
   defp fetch_partitions() do
     messages_ready =
-      from(m in Message, where: m.sender_id == parent_as(:sender).id and m.status == :ready)
+      from(m in Message,
+        as: :message,
+        where: m.sender_id == parent_as(:sender).id and m.status == :ready,
+        where:
+          is_nil(m.campaign_snapshot_id) or
+            exists(
+              from(c in Campaign,
+                where:
+                  c.id == parent_as(:message).campaign_id and c.state == :sending and
+                    not is_nil(c.render_ready_at)
+              )
+            )
+      )
 
     senders =
       from(s in Sender,

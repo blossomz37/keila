@@ -181,32 +181,43 @@ defmodule KeilaWeb.CampaignEditLive do
     changeset = merged_changeset(socket, params["campaign"])
     merged_params = changeset.params || %{}
 
-    Mailings.update_campaign(socket.assigns.campaign.id, merged_params, false)
+    Mailings.update_campaign(
+      socket.assigns.campaign.id,
+      merged_params,
+      socket.assigns.campaign.revision,
+      false
+    )
     |> case do
       {:ok, campaign} ->
         {:noreply,
          redirect(socket, to: Routes.campaign_path(socket, :index, campaign.project_id))}
 
       {:error, changeset} ->
-        {:noreply, put_changesets(socket, changeset)}
+        {:noreply, put_campaign_error(socket, changeset)}
     end
   end
 
   def handle_event("send", _, socket) do
     params = socket.assigns.changeset.params || %{}
 
-    Mailings.update_campaign(socket.assigns.campaign.id, params, true)
+    campaign = socket.assigns.campaign
+
+    Mailings.prepare_campaign(
+      campaign.id,
+      params,
+      campaign.revision,
+      DateTime.utc_now(:second),
+      mode: :immediate
+    )
     |> case do
       {:ok, campaign} ->
-        Mailings.deliver_campaign_async(campaign.id)
-
         {:noreply,
          redirect(socket,
            to: Routes.campaign_path(socket, :stats, campaign.project_id, campaign.id)
          )}
 
       {:error, changeset} ->
-        {:noreply, put_changesets(socket, changeset)}
+        {:noreply, put_campaign_error(socket, changeset)}
     end
   end
 
@@ -224,14 +235,26 @@ defmodule KeilaWeb.CampaignEditLive do
 
     params = socket.assigns.changeset.params || %{}
 
-    with {:ok, campaign} <-
-           Mailings.update_campaign(socket.assigns.campaign.id, params, true),
-         {:ok, campaign} <-
-           Mailings.schedule_campaign(campaign.id, %{scheduled_for: scheduled_for}) do
+    campaign = socket.assigns.campaign
+
+    result =
+      if is_nil(scheduled_for) do
+        Mailings.unschedule_campaign(campaign.id)
+      else
+        Mailings.prepare_campaign(
+          campaign.id,
+          params,
+          campaign.revision,
+          scheduled_for,
+          mode: :scheduled
+        )
+      end
+
+    with {:ok, campaign} <- result do
       {:noreply, redirect(socket, to: Routes.campaign_path(socket, :index, campaign.project_id))}
     else
       {:error, changeset} ->
-        {:noreply, put_changesets(socket, changeset) |> put_campaign_preview()}
+        {:noreply, put_campaign_error(socket, changeset) |> put_campaign_preview()}
     end
   end
 
@@ -512,6 +535,24 @@ defmodule KeilaWeb.CampaignEditLive do
     |> assign(:changeset, changeset)
     |> assign(:settings_changeset, changeset)
   end
+
+  defp put_campaign_error(socket, changeset = %Ecto.Changeset{}),
+    do: put_changesets(socket, changeset)
+
+  defp put_campaign_error(socket, :stale_revision),
+    do: put_flash(socket, :error, gettext("This campaign changed in another session. Reload it."))
+
+  defp put_campaign_error(socket, :immutable_campaign),
+    do:
+      put_flash(socket, :error, gettext("This campaign is already frozen and cannot be edited."))
+
+  defp put_campaign_error(socket, reason),
+    do:
+      put_flash(
+        socket,
+        :error,
+        gettext("Campaign preparation failed: %{reason}", reason: inspect(reason))
+      )
 
   defp current_template(socket, campaign) do
     Enum.find(socket.assigns.templates, &(&1.id == campaign.template_id))

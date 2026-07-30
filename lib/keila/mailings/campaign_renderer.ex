@@ -5,8 +5,7 @@ defmodule Keila.Mailings.CampaignRenderer do
   `Keila.Mailings.Renderer.Input`. Tracking is implemented as a post-render step.
   """
 
-  alias Keila.Mailings.Campaign
-  alias Keila.Mailings.Message
+  alias Keila.Mailings.{Campaign, CampaignSnapshot, Message, SnapshotBuilder}
   alias Keila.Mailings.Renderer
   alias Keila.Mailings.Renderer.{Input, Output}
   alias Keila.Contacts.Contact
@@ -22,6 +21,18 @@ defmodule Keila.Mailings.CampaignRenderer do
 
     campaign
     |> to_input(message.contact, %{"unsubscribe_link" => unsubscribe_link})
+    |> Renderer.render()
+    |> maybe_put_tracking(campaign, message)
+  end
+
+  @spec render(CampaignSnapshot.t(), Message.t()) :: Output.t()
+  def render(%CampaignSnapshot{} = snapshot, %Message{} = message) do
+    campaign = CampaignSnapshot.to_campaign(snapshot)
+    contact = SnapshotBuilder.contact_from_recipient_snapshot(message.recipient_snapshot)
+    unsubscribe_link = Keila.Mailings.get_unsubscribe_link(campaign.project_id, message.id)
+
+    campaign
+    |> to_input(contact, %{"unsubscribe_link" => unsubscribe_link})
     |> Renderer.render()
     |> maybe_put_tracking(campaign, message)
   end

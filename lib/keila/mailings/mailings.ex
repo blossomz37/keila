@@ -2,7 +2,20 @@ defmodule Keila.Mailings do
   require Keila
   use Keila.Repo
   alias Keila.Project
-  alias __MODULE__.{Sender, SenderAdapters, SharedSender, Campaign, Message, MessageActions}
+  alias Keila.Contacts.Contact
+
+  alias __MODULE__.{
+    AuditEvent,
+    Campaign,
+    CampaignSnapshot,
+    Message,
+    MessageActions,
+    Sender,
+    SenderAdapters,
+    SharedSender,
+    SnapshotBuilder
+  }
+
   alias __MODULE__.{Renderer, TransactionalMessage}
   alias KeilaWeb.Router.Helpers, as: Routes
   require Logger
@@ -338,7 +351,10 @@ defmodule Keila.Mailings do
   """
   @spec get_campaign(Campaign.id()) :: Campaign.t() | nil
   def get_campaign(id) when is_id(id) do
-    from(c in Campaign, where: c.id == ^id, preload: [:template, :segment])
+    from(c in Campaign,
+      where: c.id == ^id,
+      preload: [:template, :segment, sender: :shared_sender]
+    )
     |> Repo.one()
   end
 
@@ -350,7 +366,7 @@ defmodule Keila.Mailings do
       when is_id(project_id) and is_id(campaign_id) do
     from(c in Campaign,
       where: c.id == ^campaign_id and c.project_id == ^project_id,
-      preload: [:template, :segment]
+      preload: [:template, :segment, sender: :shared_sender]
     )
     |> Repo.one()
   end
@@ -383,7 +399,9 @@ defmodule Keila.Mailings do
   @spec get_campaigns_to_be_delivered(DateTime.t()) :: [Campaign.t()]
   def get_campaigns_to_be_delivered(time) do
     from(c in Campaign,
-      where: is_nil(c.sent_at) and not is_nil(c.scheduled_for) and c.scheduled_for <= ^time
+      where:
+        c.state == :scheduled and is_nil(c.sent_at) and not is_nil(c.scheduled_for) and
+          c.scheduled_for <= ^time
     )
     |> Repo.all()
   end
@@ -407,20 +425,62 @@ defmodule Keila.Mailings do
   If `use_send_changeset?` is set to `true`, a different changeset that
   validates whether campaign is ready to be sent is used.
   """
-  @spec update_campaign(Campaign.id(), map(), boolean()) ::
-          {:ok, Campaign.t()} | {:error, Changeset.t(Campaign.t())}
-  def update_campaign(id, params, use_send_changeset? \\ false)
-
-  def update_campaign(id, params, false) when is_id(id) do
-    get_campaign(id)
-    |> Campaign.update_changeset(params)
-    |> Repo.update()
+  @spec update_campaign(Campaign.id(), map()) ::
+          {:ok, Campaign.t()} | {:error, Changeset.t(Campaign.t()) | atom()}
+  def update_campaign(id, params) when is_id(id) do
+    case get_campaign(id) do
+      nil -> {:error, :not_found}
+      campaign -> update_campaign(id, params, campaign.revision, false)
+    end
   end
 
-  def update_campaign(id, params, true) when is_id(id) do
-    get_campaign(id)
-    |> Campaign.update_and_send_changeset(params)
-    |> Repo.update()
+  @spec update_campaign(Campaign.id(), map(), boolean() | integer()) ::
+          {:ok, Campaign.t()} | {:error, Changeset.t(Campaign.t()) | atom()}
+  def update_campaign(id, params, use_send_changeset?)
+      when is_id(id) and is_boolean(use_send_changeset?) do
+    case get_campaign(id) do
+      nil -> {:error, :not_found}
+      campaign -> update_campaign(id, params, campaign.revision, use_send_changeset?)
+    end
+  end
+
+  def update_campaign(id, params, expected_revision)
+      when is_id(id) and is_integer(expected_revision) do
+    update_campaign(id, params, expected_revision, false)
+  end
+
+  @spec update_campaign(Campaign.id(), map(), integer(), boolean()) ::
+          {:ok, Campaign.t()} | {:error, Changeset.t(Campaign.t()) | atom()}
+  def update_campaign(id, params, expected_revision, use_send_changeset?)
+      when is_id(id) and is_integer(expected_revision) and is_boolean(use_send_changeset?) do
+    Repo.transaction(fn ->
+      campaign = get_and_lock_campaign(id)
+
+      cond do
+        is_nil(campaign) ->
+          Repo.rollback(:not_found)
+
+        immutable_campaign?(campaign) ->
+          Repo.rollback(:immutable_campaign)
+
+        campaign.revision != expected_revision ->
+          Repo.rollback(:stale_revision)
+
+        true ->
+          changeset =
+            if use_send_changeset?,
+              do: Campaign.update_and_send_changeset(campaign, params),
+              else: Campaign.update_changeset(campaign, params)
+
+          changeset
+          |> optimistic_lock(:revision)
+          |> Repo.update()
+          |> case do
+            {:ok, updated} -> updated
+            {:error, changeset} -> Repo.rollback(changeset)
+          end
+      end
+    end)
   end
 
   @doc """
@@ -493,11 +553,29 @@ defmodule Keila.Mailings do
   before the campaign was originally scheduled to be delivered.
   """
   @spec schedule_campaign(Campaign.id(), map()) ::
-          {:ok, Campaign.t()} | {:error, Changeset.t(Campaign.t())}
+          {:ok, Campaign.t()} | {:error, Changeset.t(Campaign.t()) | atom() | tuple()}
   def schedule_campaign(id, params) when is_id(id) do
-    get_campaign(id)
-    |> Campaign.schedule_changeset(params)
-    |> Repo.update()
+    campaign = get_campaign(id)
+    scheduled_for = params[:scheduled_for] || params["scheduled_for"]
+
+    cond do
+      is_nil(campaign) ->
+        {:error, :not_found}
+
+      is_nil(scheduled_for) ->
+        unschedule_campaign(id)
+
+      true ->
+        expected_revision =
+          params[:expected_revision] || params["expected_revision"] || campaign.revision
+
+        idempotency_key = params[:idempotency_key] || params["idempotency_key"]
+
+        prepare_campaign(id, %{}, expected_revision, scheduled_for,
+          mode: :scheduled,
+          idempotency_key: idempotency_key
+        )
+    end
   end
 
   @doc """
@@ -510,27 +588,39 @@ defmodule Keila.Mailings do
   In case of an error, the campaign is un-scheduled if it was previously
   scheduled for sending.
   """
-  @spec deliver_campaign(Campaign.id()) :: {:error, :no_recipients} | {:error, term()} | :ok
+  @spec deliver_campaign(Campaign.id()) :: {:error, term()} | :ok
   def deliver_campaign(id) when is_id(id) do
-    result =
-      Repo.transaction(
-        fn ->
-          case get_and_lock_campaign(id) do
-            %Campaign{sent_at: sent_at} when not is_nil(sent_at) -> Repo.rollback(:already_sent)
-            %Campaign{sender_id: nil} -> Repo.rollback(:no_sender)
-            campaign = %Campaign{} -> do_deliver_campaign(campaign)
-          end
-        end,
-        timeout: 60_000
-      )
+    case get_campaign(id) do
+      nil -> {:error, :not_found}
+      campaign -> deliver_campaign(id, campaign.revision)
+    end
+  end
 
-    case result do
-      {:ok, _n} ->
-        :ok
+  @spec deliver_campaign(Campaign.id(), integer()) :: {:error, term()} | :ok
+  def deliver_campaign(id, expected_revision)
+      when is_id(id) and is_integer(expected_revision) do
+    case get_campaign(id) do
+      %Campaign{sent_at: sent_at} when not is_nil(sent_at) ->
+        {:error, :already_sent}
 
-      {:error, reason} ->
+      %Campaign{sender_id: nil} ->
         maybe_unschedule_campaign_after_failed_delivery(id)
-        {:error, reason}
+        {:error, :no_sender}
+
+      %Campaign{} ->
+        now = DateTime.utc_now(:second)
+
+        case prepare_campaign(id, %{}, expected_revision, now, mode: :immediate) do
+          {:ok, _campaign} ->
+            :ok
+
+          {:error, reason} ->
+            maybe_unschedule_campaign_after_failed_delivery(id)
+            {:error, normalize_delivery_error(reason)}
+        end
+
+      nil ->
+        {:error, :not_found}
     end
   end
 
@@ -568,63 +658,240 @@ defmodule Keila.Mailings do
   end
 
   defp get_and_lock_campaign(id) when is_id(id) do
-    from(c in Campaign, where: c.id == ^id, lock: "FOR NO KEY UPDATE", preload: :segment)
+    from(c in Campaign,
+      where: c.id == ^id,
+      lock: "FOR NO KEY UPDATE",
+      preload: [:template, :segment, sender: :shared_sender]
+    )
     |> Repo.one()
   end
 
-  defp do_deliver_campaign(campaign) do
-    {:ok, campaign} =
-      campaign
-      |> change(sent_at: DateTime.truncate(DateTime.utc_now(), :second))
-      |> Repo.update()
+  @doc """
+  Atomically freezes a draft campaign and its current active audience.
 
-    segment_filter = if campaign.segment, do: campaign.segment.filter, else: %{}
-    filter = %{"$and" => [segment_filter, %{"status" => "active"}]}
+  `:scheduled` preparation renders immediately but remains ineligible for
+  delivery until `start_scheduled_campaign/1` transitions it to `:sending`.
+  `:immediate` preparation uses the same transaction and starts in `:sending`.
+  """
+  @spec prepare_campaign(Campaign.id(), map(), integer(), DateTime.t(), keyword()) ::
+          {:ok, Campaign.t()} | {:error, term()}
+  def prepare_campaign(id, draft_params, expected_revision, scheduled_for, opts \\ [])
+      when is_id(id) and is_map(draft_params) and is_integer(expected_revision) do
+    mode = Keyword.get(opts, :mode, :scheduled)
 
-    Keila.Contacts.stream_project_contacts(campaign.project_id, filter: filter)
-    |> Stream.chunk_every(5000)
-    |> Stream.map(fn contacts ->
-      insert_messages(contacts, campaign)
-    end)
-    |> Enum.sum()
-    |> tap(&maybe_consume_credits(&1, campaign))
-    |> tap(&insert_rendering_job(&1, campaign))
-    |> tap(&ensure_not_empty/1)
+    idempotency_key =
+      Keyword.get(opts, :idempotency_key) ||
+        preparation_key(id, expected_revision, scheduled_for, mode)
+
+    Repo.transaction(
+      fn ->
+        campaign = get_and_lock_campaign(id)
+
+        case get_preparation_by_key(id, idempotency_key) do
+          %CampaignSnapshot{} ->
+            get_campaign(id)
+
+          nil ->
+            prepare_new_campaign(
+              campaign,
+              draft_params,
+              expected_revision,
+              scheduled_for,
+              idempotency_key,
+              mode
+            )
+        end
+      end,
+      timeout: 60_000
+    )
   end
 
-  @unrendered_status Ecto.Enum.mappings(Message, :status)[:unrendered]
-  defp insert_messages(contacts, campaign) do
-    {:ok, campaign_id} = Keila.Mailings.Campaign.Id.dump(campaign.id)
-    {:ok, sender_id} = Keila.Mailings.Sender.Id.dump(campaign.sender_id)
-    Logger.info("Inserting messages for campaign #{campaign_id} with sender #{sender_id}")
+  defp prepare_new_campaign(
+         nil,
+         _draft_params,
+         _expected_revision,
+         _scheduled_for,
+         _idempotency_key,
+         _mode
+       ),
+       do: Repo.rollback(:not_found)
 
-    # Inserting entries like this is about 1/3 more performant than constructing structs first
-    contact_ids =
-      Enum.map(contacts, fn contact ->
-        {:ok, id} = Keila.Contacts.Contact.Id.dump(contact.id)
-        %{id: id}
-      end)
+  defp prepare_new_campaign(
+         campaign,
+         draft_params,
+         expected_revision,
+         scheduled_for,
+         idempotency_key,
+         mode
+       ) do
+    cond do
+      immutable_campaign?(campaign) ->
+        Repo.rollback(:immutable_campaign)
 
-    {:ok, project_id} = Keila.Projects.Project.Id.dump(campaign.project_id)
+      campaign.revision != expected_revision ->
+        Repo.rollback(:stale_revision)
 
-    {count, _} =
-      Repo.insert_all(
-        Message,
-        from(c in values(contact_ids, %{id: :integer}),
-          select: %{
-            contact_id: c.id,
-            campaign_id: ^campaign_id,
-            sender_id: ^sender_id,
-            inserted_at: fragment("now()"),
-            updated_at: fragment("now()"),
-            status: @unrendered_status,
-            project_id: ^project_id
+      mode not in [:scheduled, :immediate] ->
+        Repo.rollback(:invalid_preparation_mode)
+
+      true ->
+        scheduled_for = validate_preparation_time!(campaign, scheduled_for, mode)
+
+        campaign =
+          campaign
+          |> Campaign.update_and_send_changeset(draft_params)
+          |> optimistic_lock(:revision)
+          |> force_change(:revision, expected_revision + 1)
+          |> Repo.update()
+          |> case do
+            {:ok, updated} ->
+              Repo.preload(updated, [:template, :segment, sender: :shared_sender], force: true)
+
+            {:error, changeset} ->
+              Repo.rollback(changeset)
+          end
+
+        audience_filter = campaign_audience_filter(campaign)
+
+        contacts =
+          Keila.Contacts.get_project_contacts(campaign.project_id, filter: audience_filter)
+
+        audience_count = length(contacts)
+        ensure_not_empty(audience_count)
+        maybe_consume_credits(audience_count, campaign)
+
+        {:ok, snapshot_params} = SnapshotBuilder.build(campaign, audience_filter)
+
+        snapshot =
+          snapshot_params
+          |> Map.merge(%{
+            campaign_id: campaign.id,
+            source_revision: campaign.revision,
+            snapshot_sequence: next_snapshot_sequence(campaign.id),
+            idempotency_key: idempotency_key,
+            audience_count: audience_count,
+            frozen_at: DateTime.utc_now(:second)
+          })
+          |> CampaignSnapshot.creation_changeset()
+          |> Repo.insert!()
+
+        insert_snapshot_messages(contacts, campaign, snapshot)
+
+        now = DateTime.utc_now(:second)
+        state = if mode == :immediate, do: :sending, else: :scheduled
+        sent_at = if mode == :immediate, do: now
+
+        campaign =
+          campaign
+          |> change(%{
+            active_snapshot_id: snapshot.id,
+            scheduled_for: scheduled_for,
+            state: state,
+            sent_at: sent_at,
+            render_ready_at: nil,
+            paused_reason: nil
+          })
+          |> Repo.update!()
+
+        %{
+          campaign_id: campaign.id,
+          campaign_snapshot_id: snapshot.id,
+          event: "campaign_prepared",
+          metadata: %{
+            "mode" => to_string(mode),
+            "source_revision" => campaign.revision,
+            "audience_count" => audience_count
           }
-        )
-      )
+        }
+        |> AuditEvent.creation_changeset()
+        |> Repo.insert!()
 
-    count
+        insert_rendering_job(audience_count, campaign)
+        Repo.preload(campaign, [:template, :segment, sender: :shared_sender], force: true)
+    end
   end
+
+  defp validate_preparation_time!(_campaign, scheduled_for, :immediate) do
+    case Ecto.Type.cast(:utc_datetime, scheduled_for) do
+      {:ok, datetime} -> datetime
+      :error -> Repo.rollback(:invalid_schedule)
+    end
+  end
+
+  defp validate_preparation_time!(campaign, scheduled_for, :scheduled) do
+    changeset = Campaign.schedule_changeset(campaign, %{scheduled_for: scheduled_for})
+
+    if changeset.valid? do
+      get_field(changeset, :scheduled_for)
+    else
+      Repo.rollback(changeset)
+    end
+  end
+
+  defp campaign_audience_filter(campaign) do
+    segment_filter = if campaign.segment, do: campaign.segment.filter, else: %{}
+    %{"$and" => [segment_filter, %{"status" => "active"}]}
+  end
+
+  defp next_snapshot_sequence(campaign_id) do
+    from(s in CampaignSnapshot, where: s.campaign_id == ^campaign_id)
+    |> Repo.aggregate(:max, :snapshot_sequence)
+    |> case do
+      nil -> 1
+      sequence -> sequence + 1
+    end
+  end
+
+  defp insert_snapshot_messages(contacts, campaign, snapshot) do
+    now = DateTime.utc_now(:second)
+
+    contacts
+    |> Enum.chunk_every(5000)
+    |> Enum.each(fn chunk ->
+      entries =
+        Enum.map(chunk, fn contact ->
+          %{
+            contact_id: contact.id,
+            campaign_id: campaign.id,
+            campaign_snapshot_id: snapshot.id,
+            recipient_snapshot: SnapshotBuilder.recipient_snapshot(contact),
+            sender_id: campaign.sender_id,
+            project_id: campaign.project_id,
+            status: :unrendered,
+            inserted_at: now,
+            updated_at: now
+          }
+        end)
+
+      Repo.insert_all(Message, entries)
+    end)
+  end
+
+  defp get_preparation_by_key(campaign_id, idempotency_key) do
+    from(s in CampaignSnapshot,
+      where: s.campaign_id == ^campaign_id and s.idempotency_key == ^idempotency_key
+    )
+    |> Repo.one()
+  end
+
+  defp preparation_key(campaign_id, revision, scheduled_for, mode) do
+    [campaign_id, revision, scheduled_for, mode]
+    |> :erlang.term_to_binary([:deterministic])
+    |> then(&:crypto.hash(:sha256, &1))
+    |> Base.encode16(case: :lower)
+  end
+
+  defp immutable_campaign?(campaign) do
+    campaign.state != :draft or
+      not is_nil(campaign.sent_at) or
+      not is_nil(campaign.active_snapshot_id)
+  end
+
+  defp normalize_delivery_error(%Changeset{} = changeset) do
+    if get_field(changeset, :sender_id), do: changeset, else: :no_sender
+  end
+
+  defp normalize_delivery_error(reason), do: reason
 
   defp maybe_consume_credits(messages_count, _campaign = %{project_id: project_id}) do
     if Keila.Accounts.credits_enabled?() do
@@ -651,6 +918,105 @@ defmodule Keila.Mailings do
 
   defp ensure_not_empty(0), do: Repo.rollback(:no_recipients)
   defp ensure_not_empty(_), do: :ok
+
+  @doc """
+  Cancels a prepared campaign before delivery begins and preserves its frozen evidence.
+  """
+  @spec unschedule_campaign(Campaign.id()) :: {:ok, Campaign.t()} | {:error, atom()}
+  def unschedule_campaign(id) when is_id(id) do
+    Repo.transaction(fn ->
+      campaign = get_and_lock_campaign(id)
+
+      cond do
+        is_nil(campaign) ->
+          Repo.rollback(:not_found)
+
+        campaign.state == :draft and is_nil(campaign.active_snapshot_id) ->
+          campaign
+          |> change(scheduled_for: nil)
+          |> Repo.update!()
+
+        campaign.state != :scheduled or not is_nil(campaign.first_attempt_at) ->
+          Repo.rollback(:cannot_unschedule)
+
+        true ->
+          now = DateTime.utc_now(:second)
+          snapshot = Repo.get!(CampaignSnapshot, campaign.active_snapshot_id)
+          snapshot |> CampaignSnapshot.cancel_changeset(now) |> Repo.update!()
+
+          from(m in Message,
+            where:
+              m.campaign_snapshot_id == ^snapshot.id and
+                m.status in [:unrendered, :ready, :queued],
+            update: [set: [status: :canceled, updated_at: ^now]]
+          )
+          |> Repo.update_all([])
+
+          updated =
+            campaign
+            |> change(%{
+              active_snapshot_id: nil,
+              scheduled_for: nil,
+              state: :draft,
+              render_ready_at: nil,
+              revision: campaign.revision + 1
+            })
+            |> Repo.update!()
+
+          %{
+            campaign_id: campaign.id,
+            campaign_snapshot_id: snapshot.id,
+            event: "campaign_unscheduled"
+          }
+          |> AuditEvent.creation_changeset()
+          |> Repo.insert!()
+
+          updated
+      end
+    end)
+  end
+
+  @doc """
+  Makes a due, fully rendered campaign eligible for scheduler claims.
+  """
+  @spec start_scheduled_campaign(Campaign.id()) :: {:ok, Campaign.t()} | {:error, atom()}
+  def start_scheduled_campaign(id) when is_id(id) do
+    Repo.transaction(fn ->
+      campaign = get_and_lock_campaign(id)
+
+      cond do
+        is_nil(campaign) ->
+          Repo.rollback(:not_found)
+
+        campaign.state != :scheduled ->
+          Repo.rollback(:not_scheduled)
+
+        is_nil(campaign.render_ready_at) ->
+          Repo.rollback(:render_not_ready)
+
+        DateTime.after?(campaign.scheduled_for, DateTime.utc_now()) ->
+          Repo.rollback(:not_due)
+
+        true ->
+          now = DateTime.utc_now(:second)
+
+          updated =
+            campaign
+            |> change(state: :sending, sent_at: now)
+            |> Repo.update!()
+
+          %{
+            campaign_id: campaign.id,
+            campaign_snapshot_id: campaign.active_snapshot_id,
+            event: "campaign_started"
+          }
+          |> AuditEvent.creation_changeset()
+          |> Repo.insert!()
+
+          updated
+      end
+    end)
+  end
 
   @doc """
   Starts the delivery of a campaign as a Task supervised by `Keila.TaskSupervisor`.
@@ -915,6 +1281,19 @@ defmodule Keila.Mailings do
   end
 
   @doc """
+  Retrieves the immutable active snapshot for a public, started campaign.
+  """
+  @spec get_public_campaign_snapshot(Campaign.id()) :: CampaignSnapshot.t() | nil
+  def get_public_campaign_snapshot(campaign_id) do
+    from(s in CampaignSnapshot,
+      join: c in Campaign,
+      on: c.active_snapshot_id == s.id,
+      where: c.id == ^campaign_id and c.public_link_enabled == true and not is_nil(c.sent_at)
+    )
+    |> Repo.one()
+  end
+
+  @doc """
   Returns the public campaign link URL for a given campaign ID.
 
   This is just a convenience function and doesn't actually check whether the
@@ -946,6 +1325,7 @@ defmodule Keila.Mailings do
         m.id in subquery(
           from(m in Message,
             where: m.status in [:sent, :failed],
+            where: is_nil(m.campaign_snapshot_id),
             where: m.updated_at < ^cutoff,
             where: not is_nil(m.html_body) or not is_nil(m.text_body),
             select: m.id

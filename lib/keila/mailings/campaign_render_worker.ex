@@ -20,8 +20,7 @@ defmodule Keila.Mailings.CampaignRenderWorker do
 
   use Keila.Repo
   require Logger
-  alias Keila.Mailings.Message
-  alias Keila.Mailings.CampaignRenderer
+  alias Keila.Mailings.{Campaign, CampaignRenderer, CampaignSnapshot, Message, SnapshotBuilder}
   alias Keila.Contacts
   alias Keila.Contacts.Contact
 
@@ -36,11 +35,15 @@ defmodule Keila.Mailings.CampaignRenderWorker do
     if is_nil(campaign) do
       {:cancel, :campaign_not_found}
     else
-      render_messages(campaign)
+      snapshot =
+        if campaign.active_snapshot_id,
+          do: Repo.get(CampaignSnapshot, campaign.active_snapshot_id)
+
+      render_messages(campaign, snapshot)
     end
   end
 
-  defp render_messages(campaign) do
+  defp render_messages(campaign, snapshot) do
     from(m in Message,
       where: m.campaign_id == ^campaign.id and m.status == :unrendered,
       left_join: c in assoc(m, :contact),
@@ -48,7 +51,7 @@ defmodule Keila.Mailings.CampaignRenderWorker do
       limit: @batch_size
     )
     |> Repo.all()
-    |> async_render_messages(campaign)
+    |> async_render_messages(campaign, snapshot)
     |> tap(&update_rendered_messages/1)
     |> tap(&update_failed_messages/1)
     |> tap(&update_messages_for_retry/1)
@@ -57,13 +60,14 @@ defmodule Keila.Mailings.CampaignRenderWorker do
         Oban.insert!(new(%{"campaign_id" => campaign.id}))
       end
     end)
+    |> tap(fn _results -> finalize_campaign_render(campaign) end)
 
     :ok
   end
 
-  defp async_render_messages(messages, campaign) do
+  defp async_render_messages(messages, campaign, snapshot) do
     messages
-    |> Task.async_stream(&render_message(&1, campaign),
+    |> Task.async_stream(&render_message(&1, campaign, snapshot),
       timeout: @render_timeout,
       on_timeout: :kill_task,
       zip_input_on_exit: true
@@ -78,7 +82,7 @@ defmodule Keila.Mailings.CampaignRenderWorker do
     end)
   end
 
-  defp render_message(message, campaign) do
+  defp render_message(message, campaign, nil) do
     with %Contact{} <- message.contact,
          %{valid?: true} = output <- CampaignRenderer.render(campaign, message) do
       {message, {:ok, output}}
@@ -98,6 +102,32 @@ defmodule Keila.Mailings.CampaignRenderWorker do
     e ->
       Logger.error(
         "CampaignRenderWorker: exception rendering message #{message.id}: #{Exception.message(e)}"
+      )
+
+      {message, :error}
+  end
+
+  defp render_message(message, _campaign, snapshot = %CampaignSnapshot{}) do
+    with recipient when is_map(recipient) <- message.recipient_snapshot,
+         %{valid?: true} = output <- CampaignRenderer.render(snapshot, message) do
+      contact = SnapshotBuilder.contact_from_recipient_snapshot(recipient)
+      {%{message | contact: contact}, {:ok, output}}
+    else
+      nil ->
+        Logger.warning("CampaignRenderWorker: message #{message.id} has no recipient snapshot")
+        {message, :error}
+
+      %{valid?: false} = output ->
+        Logger.warning(
+          "CampaignRenderWorker: snapshot render error for message #{message.id}: #{inspect(output.errors)}"
+        )
+
+        {message, :error}
+    end
+  rescue
+    e ->
+      Logger.error(
+        "CampaignRenderWorker: exception rendering snapshot message #{message.id}: #{Exception.message(e)}"
       )
 
       {message, :error}
@@ -196,6 +226,45 @@ defmodule Keila.Mailings.CampaignRenderWorker do
         ]
       )
       |> Repo.update_all([])
+    end
+  end
+
+  defp finalize_campaign_render(%Campaign{active_snapshot_id: nil}), do: :ok
+
+  defp finalize_campaign_render(campaign) do
+    counts =
+      from(m in Message,
+        where: m.campaign_snapshot_id == ^campaign.active_snapshot_id,
+        select: %{
+          unrendered: filter(count(m.id), m.status == :unrendered),
+          failed: filter(count(m.id), m.status == :failed)
+        }
+      )
+      |> Repo.one()
+
+    cond do
+      counts.failed > 0 ->
+        from(c in Campaign,
+          where: c.id == ^campaign.id and c.active_snapshot_id == ^campaign.active_snapshot_id,
+          update: [
+            set: [
+              state: :paused,
+              paused_reason: "render_failure",
+              updated_at: fragment("NOW()")
+            ]
+          ]
+        )
+        |> Repo.update_all([])
+
+      counts.unrendered == 0 ->
+        from(c in Campaign,
+          where: c.id == ^campaign.id and c.active_snapshot_id == ^campaign.active_snapshot_id,
+          update: [set: [render_ready_at: fragment("NOW()"), updated_at: fragment("NOW()")]]
+        )
+        |> Repo.update_all([])
+
+      true ->
+        :ok
     end
   end
 

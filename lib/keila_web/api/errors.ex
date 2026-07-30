@@ -24,6 +24,14 @@ defmodule KeilaWeb.Api.Errors do
     |> render("errors.json", %{errors: [[status: 404, title: "Not found"]]})
   end
 
+  @spec send_409(Conn.t(), String.t()) :: Conn.t()
+  def send_409(conn, title) do
+    conn
+    |> put_status(409)
+    |> put_view(KeilaWeb.ApiErrorView)
+    |> render("errors.json", %{errors: [[status: 409, title: title]]})
+  end
+
   @spec send_changeset_error(Conn.t(), Ecto.Changeset.t()) :: Conn.t()
   def send_changeset_error(conn, changeset) do
     conn

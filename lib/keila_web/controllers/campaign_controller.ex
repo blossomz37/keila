@@ -193,7 +193,7 @@ defmodule KeilaWeb.CampaignController do
     project = current_project(conn)
     campaign = conn.assigns.campaign
 
-    if is_nil(campaign.sent_at) do
+    if campaign.state in [:draft, :scheduled] and is_nil(campaign.sent_at) do
       senders = Mailings.get_project_senders(project.id)
       templates = Templates.get_project_templates(project.id)
       segments = Contacts.get_project_segments(project.id)

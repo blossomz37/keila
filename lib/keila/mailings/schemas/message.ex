@@ -1,7 +1,7 @@
 defmodule Keila.Mailings.Message do
   use Keila.Schema, prefix: "mr"
   alias Keila.Contacts.Contact
-  alias Keila.Mailings.Campaign
+  alias Keila.Mailings.{Campaign, CampaignSnapshot}
   alias Keila.Mailings.Sender
   alias Keila.Projects.Project
   alias Keila.Contacts.Form
@@ -19,7 +19,12 @@ defmodule Keila.Mailings.Message do
 
     field(:priority, :integer, default: 100)
     field(:render_attempt, :integer, default: 0)
-    field(:status, Ecto.Enum, values: [unrendered: 0, ready: 1, queued: 2, sent: 10, failed: -1])
+
+    field(:status, Ecto.Enum,
+      values: [unrendered: 0, ready: 1, queued: 2, sent: 10, failed: -1, canceled: -2]
+    )
+
+    field(:recipient_snapshot, :map)
 
     field(:receipt, :string)
     field(:queued_at, :utc_datetime)
@@ -35,6 +40,7 @@ defmodule Keila.Mailings.Message do
     belongs_to(:project, Project, type: Project.Id)
     belongs_to(:contact, Contact, type: Contact.Id)
     belongs_to(:campaign, Campaign, type: Campaign.Id)
+    belongs_to(:campaign_snapshot, CampaignSnapshot, type: CampaignSnapshot.Id)
     belongs_to(:sender, Sender, type: Sender.Id)
     belongs_to(:form, Form, type: Form.Id)
     belongs_to(:form_params, FormParams, type: FormParams.Id)
@@ -68,6 +74,8 @@ defmodule Keila.Mailings.Message do
       :project_id,
       :contact_id,
       :campaign_id,
+      :campaign_snapshot_id,
+      :recipient_snapshot,
       :sender_id,
       :form_id,
       :form_params_id

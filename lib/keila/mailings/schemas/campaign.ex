@@ -1,7 +1,7 @@
 defmodule Keila.Mailings.Campaign do
   use Keila.Schema, prefix: "mc"
   alias Keila.Contacts.Segment
-  alias Keila.Mailings.Sender
+  alias Keila.Mailings.{CampaignSnapshot, Sender}
   alias Keila.Projects.Project
   alias Keila.Templates.Template
 
@@ -40,8 +40,19 @@ defmodule Keila.Mailings.Campaign do
 
     field :sent_at, :utc_datetime
     field :scheduled_for, :utc_datetime
+    field :revision, :integer, default: 1
+
+    field :state, Ecto.Enum,
+      values: [draft: 0, scheduled: 1, sending: 2, paused: 3, sent: 4, canceled: 5],
+      default: :draft
+
+    field :render_ready_at, :utc_datetime
+    field :first_attempt_at, :utc_datetime
+    field :completed_at, :utc_datetime
+    field :paused_reason, :string
 
     embeds_one :settings, __MODULE__.Settings
+    belongs_to :active_snapshot, CampaignSnapshot, type: CampaignSnapshot.Id
     belongs_to :template, Template, type: Template.Id
     belongs_to :sender, Sender, type: Sender.Id
     belongs_to :project, Project, type: Project.Id

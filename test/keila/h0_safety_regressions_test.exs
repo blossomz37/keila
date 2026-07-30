@@ -19,6 +19,7 @@ defmodule Keila.Hardening.AcceptThenCrashAdapter do
     {:ok, %{id: "accepted-#{call_number}"}}
   end
 end
+
 defmodule Keila.Hardening.H0SafetyRegressionsTest do
   use KeilaWeb.ConnCase, async: false
   use Oban.Testing, repo: Keila.Repo

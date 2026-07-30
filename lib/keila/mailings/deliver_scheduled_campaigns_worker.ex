@@ -5,7 +5,9 @@ defmodule Keila.Mailings.DeliverScheduledCampaignsWorker do
   def perform(%Oban.Job{}) do
     Mailings.get_campaigns_to_be_delivered(DateTime.utc_now())
     |> Enum.each(fn c ->
-      Mailings.deliver_campaign_async(c.id)
+      Mailings.start_scheduled_campaign(c.id)
     end)
+
+    :ok
   end
 end
