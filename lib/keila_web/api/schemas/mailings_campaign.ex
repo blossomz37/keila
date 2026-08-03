@@ -115,6 +115,22 @@ defmodule KeilaWeb.Api.Schemas.MailingsCampaign do
       type: :utc_datetime,
       example: DateTime.utc_now() |> DateTime.to_iso8601()
     },
+    revision: %{
+      type: :integer,
+      description: "Optimistic campaign revision used for guarded updates and preparation.",
+      example: 1
+    },
+    state: %{
+      type: :string,
+      enum: ["draft", "scheduled", "sending", "paused", "sent", "canceled"]
+    },
+    active_snapshot_id: %{
+      type: :string
+    },
+    render_ready_at: %{
+      type: :utc_datetime,
+      example: DateTime.utc_now() |> DateTime.to_iso8601()
+    },
     inserted_at: %{
       type: :string,
       format: :utc_datetime,
@@ -194,16 +210,24 @@ defmodule KeilaWeb.Api.Schemas.MailingsCampaign.UpdateParams do
     :sender_id,
     :segment_id,
     :data,
-    :preview_text
+    :preview_text,
+    :revision
   ]
-  build_open_api_schema(@properties, only: @allowed_properties)
+  build_open_api_schema(@properties, only: @allowed_properties, required: [:revision])
 end
 
 defmodule KeilaWeb.Api.Schemas.MailingsCampaign.ScheduleParams do
   use KeilaWeb.Api.Schema
 
   @properties KeilaWeb.Api.Schemas.MailingsCampaign.properties()
-  build_open_api_schema(@properties, only: [:scheduled_for])
+  build_open_api_schema(@properties, only: [:scheduled_for, :revision], required: [:revision])
+end
+
+defmodule KeilaWeb.Api.Schemas.MailingsCampaign.DeliveryParams do
+  use KeilaWeb.Api.Schema
+
+  @properties KeilaWeb.Api.Schemas.MailingsCampaign.properties()
+  build_open_api_schema(@properties, only: [:revision], required: [:revision])
 end
 
 defmodule KeilaWeb.Api.Schemas.MailingsCampaign.DeliveryQueuedResponse do

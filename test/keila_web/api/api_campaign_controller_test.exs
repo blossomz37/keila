@@ -1,5 +1,6 @@
 defmodule KeilaWeb.ApiCampaignControllerTest do
   use KeilaWeb.ApiCase
+  alias Keila.Mailings
 
   describe "GET /api/v1/campaigns" do
     @tag :api_campaign_controller
@@ -92,9 +93,16 @@ defmodule KeilaWeb.ApiCampaignControllerTest do
   describe "PATCH /api/v1/campaigns/:id" do
     @tag :api_campaign_controller
     test "updates existing campaign", %{authorized_conn: conn, project: project} do
-      %{id: id} = insert!(:mailings_campaign, project_id: project.id)
+      %{id: id, revision: revision} = insert!(:mailings_campaign, project_id: project.id)
 
-      body = %{"data" => %{"subject" => "Updated Subject", "settings" => %{"type" => "markdown"}}}
+      body = %{
+        "data" => %{
+          "subject" => "Updated Subject",
+          "settings" => %{"type" => "markdown"},
+          "revision" => revision
+        }
+      }
+
       conn = patch_json(conn, Routes.api_campaign_path(conn, :update, id), body)
 
       assert %{
@@ -112,9 +120,10 @@ defmodule KeilaWeb.ApiCampaignControllerTest do
 
     @tag :api_campaign_controller
     test "also works when settings are not provided", %{authorized_conn: conn, project: project} do
-      %{id: id} = insert!(:mailings_campaign, project_id: project.id, settings: %{type: "mjml"})
+      %{id: id, revision: revision} =
+        insert!(:mailings_campaign, project_id: project.id, settings: %{type: "mjml"})
 
-      body = %{"data" => %{"subject" => "Updated Subject"}}
+      body = %{"data" => %{"subject" => "Updated Subject", "revision" => revision}}
       conn = patch_json(conn, Routes.api_campaign_path(conn, :update, id), body)
 
       assert %{
@@ -128,6 +137,29 @@ defmodule KeilaWeb.ApiCampaignControllerTest do
              } = json_response(conn, 200)
 
       assert %{subject: "Updated Subject"} = Keila.Mailings.get_campaign(id)
+    end
+
+    @tag :api_campaign_controller
+    test "returns conflict for a stale campaign revision", %{
+      authorized_conn: conn,
+      project: project
+    } do
+      %{id: id, revision: revision} = insert!(:mailings_campaign, project_id: project.id)
+
+      first =
+        patch_json(conn, Routes.api_campaign_path(conn, :update, id), %{
+          "data" => %{"subject" => "First update", "revision" => revision}
+        })
+
+      assert json_response(first, 200)
+
+      stale =
+        patch_json(conn, Routes.api_campaign_path(conn, :update, id), %{
+          "data" => %{"subject" => "Stale update", "revision" => revision}
+        })
+
+      assert %{"errors" => [%{"status" => "409"}]} = json_response(stale, 409)
+      assert Mailings.get_campaign(id).subject == "First update"
     end
   end
 
@@ -149,10 +181,16 @@ defmodule KeilaWeb.ApiCampaignControllerTest do
     @tag :api_campaign_controller
     test "returns 202", %{authorized_conn: conn, project: project} do
       sender = insert!(:mailings_sender, project_id: project.id)
-      %{id: id} = insert!(:mailings_campaign, project_id: project.id, sender_id: sender.id)
+
+      %{id: id, revision: revision} =
+        insert!(:mailings_campaign, project_id: project.id, sender_id: sender.id)
+
       insert_n!(:contact, 50, fn _n -> %{project_id: project.id} end)
 
-      conn = post(conn, Routes.api_campaign_path(conn, :deliver, id))
+      conn =
+        post_json(conn, Routes.api_campaign_path(conn, :deliver, id), %{
+          "data" => %{"revision" => revision}
+        })
 
       assert %{
                "delivery_queued" => true,
@@ -169,7 +207,10 @@ defmodule KeilaWeb.ApiCampaignControllerTest do
     @tag :api_campaign_controller
     test "returns updated campaign", %{authorized_conn: conn, project: project} do
       sender = insert!(:mailings_sender, project_id: project.id)
-      %{id: id} = insert!(:mailings_campaign, project_id: project.id, sender_id: sender.id)
+
+      %{id: id, revision: revision} =
+        insert!(:mailings_campaign, project_id: project.id, sender_id: sender.id)
+
       insert_n!(:contact, 50, fn _n -> %{project_id: project.id} end)
 
       scheduled_for =
@@ -177,7 +218,8 @@ defmodule KeilaWeb.ApiCampaignControllerTest do
 
       body = %{
         "data" => %{
-          "scheduled_for" => scheduled_for |> DateTime.to_iso8601()
+          "scheduled_for" => scheduled_for |> DateTime.to_iso8601(),
+          "revision" => revision
         }
       }
 

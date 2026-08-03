@@ -1,5 +1,7 @@
 defmodule KeilaWeb.PublicCampaignControllerTest do
   use KeilaWeb.ConnCase, async: true
+  import Ecto.Query
+  alias Keila.{Mailings, Repo}
 
   setup do
     group = insert!(:group)
@@ -90,6 +92,49 @@ defmodule KeilaWeb.PublicCampaignControllerTest do
 
       conn = get(conn, Routes.public_campaign_path(conn, :show, campaign.id))
       assert response(conn, 404)
+    end
+
+    test "serves the frozen snapshot after the campaign row changes", %{
+      conn: conn,
+      project: project
+    } do
+      sender =
+        insert!(:mailings_sender,
+          project_id: project.id,
+          config: %Mailings.Sender.Config{type: "test"}
+        )
+
+      insert!(:contact, project_id: project.id)
+
+      campaign =
+        insert!(:mailings_campaign,
+          project_id: project.id,
+          sender_id: sender.id,
+          public_link_enabled: true,
+          text_body: "Frozen archive body",
+          settings: %{type: :text}
+        )
+
+      assert {:ok, _prepared} =
+               Mailings.prepare_campaign(
+                 campaign.id,
+                 %{},
+                 campaign.revision,
+                 DateTime.utc_now(:second),
+                 mode: :immediate
+               )
+
+      from(c in Mailings.Campaign,
+        where: c.id == ^campaign.id,
+        update: [set: [text_body: "Mutated campaign body"]]
+      )
+      |> Repo.update_all([])
+
+      archived = get(conn, Routes.public_campaign_path(conn, :show, campaign.id))
+      body = text_response(archived, 200)
+
+      assert body =~ "Frozen archive body"
+      refute body =~ "Mutated campaign body"
     end
   end
 end

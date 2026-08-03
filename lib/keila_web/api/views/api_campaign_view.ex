@@ -45,6 +45,10 @@ defmodule KeilaWeb.ApiCampaignView do
     :segment_id,
     :sent_at,
     :scheduled_for,
+    :revision,
+    :state,
+    :active_snapshot_id,
+    :render_ready_at,
     :updated_at,
     :inserted_at,
     :preview_text

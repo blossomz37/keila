@@ -1,7 +1,7 @@
 defmodule Keila.Mailings.Message do
   use Keila.Schema, prefix: "mr"
   alias Keila.Contacts.Contact
-  alias Keila.Mailings.Campaign
+  alias Keila.Mailings.{Campaign, CampaignSnapshot}
   alias Keila.Mailings.Sender
   alias Keila.Projects.Project
   alias Keila.Contacts.Form
@@ -19,14 +19,34 @@ defmodule Keila.Mailings.Message do
 
     field(:priority, :integer, default: 100)
     field(:render_attempt, :integer, default: 0)
-    field(:status, Ecto.Enum, values: [unrendered: 0, ready: 1, queued: 2, sent: 10, failed: -1])
+
+    field(:status, Ecto.Enum,
+      values: [
+        unrendered: 0,
+        ready: 1,
+        queued: 2,
+        attempting: 3,
+        sent: 10,
+        failed: -1,
+        canceled: -2,
+        suppressed: -3,
+        uncertain: -4
+      ]
+    )
+
+    field(:recipient_snapshot, :map)
 
     field(:receipt, :string)
+    field(:claim_token, Ecto.UUID)
     field(:queued_at, :utc_datetime)
+    field(:claimed_at, :utc_datetime)
+    field(:attempting_at, :utc_datetime)
     field(:sent_at, :utc_datetime)
     field(:opened_at, :utc_datetime)
     field(:clicked_at, :utc_datetime)
     field(:failed_at, :utc_datetime)
+    field(:suppressed_at, :utc_datetime)
+    field(:uncertain_at, :utc_datetime)
     field(:soft_bounce_received_at, :utc_datetime)
     field(:hard_bounce_received_at, :utc_datetime)
     field(:complaint_received_at, :utc_datetime)
@@ -35,6 +55,7 @@ defmodule Keila.Mailings.Message do
     belongs_to(:project, Project, type: Project.Id)
     belongs_to(:contact, Contact, type: Contact.Id)
     belongs_to(:campaign, Campaign, type: Campaign.Id)
+    belongs_to(:campaign_snapshot, CampaignSnapshot, type: CampaignSnapshot.Id)
     belongs_to(:sender, Sender, type: Sender.Id)
     belongs_to(:form, Form, type: Form.Id)
     belongs_to(:form_params, FormParams, type: FormParams.Id)
@@ -56,11 +77,16 @@ defmodule Keila.Mailings.Message do
       :priority,
       :status,
       :receipt,
+      :claim_token,
       :queued_at,
+      :claimed_at,
+      :attempting_at,
       :sent_at,
       :opened_at,
       :clicked_at,
       :failed_at,
+      :suppressed_at,
+      :uncertain_at,
       :soft_bounce_received_at,
       :hard_bounce_received_at,
       :complaint_received_at,
@@ -68,6 +94,8 @@ defmodule Keila.Mailings.Message do
       :project_id,
       :contact_id,
       :campaign_id,
+      :campaign_snapshot_id,
+      :recipient_snapshot,
       :sender_id,
       :form_id,
       :form_params_id

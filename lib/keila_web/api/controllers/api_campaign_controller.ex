@@ -85,11 +85,16 @@ defmodule KeilaWeb.ApiCampaignController do
         |> Ecto.Changeset.apply_changes()
         |> Map.from_struct()
 
-      params = Map.put(conn.body_params.data, :settings, settings_params)
+      expected_revision = conn.body_params.data[:revision] || campaign.revision
 
-      case Mailings.update_campaign(id, params) do
+      params =
+        conn.body_params.data
+        |> Map.delete(:revision)
+        |> Map.put(:settings, settings_params)
+
+      case Mailings.update_campaign(id, params, expected_revision) do
         {:ok, campaign} -> render(conn, "campaign.json", %{campaign: campaign})
-        {:error, changeset} -> Errors.send_changeset_error(conn, changeset)
+        {:error, reason} -> send_campaign_error(conn, reason)
       end
     else
       _ -> Errors.send_404(conn)
@@ -115,6 +120,8 @@ defmodule KeilaWeb.ApiCampaignController do
   operation(:deliver,
     summary: "Deliver Campaign",
     parameters: [id: [in: :path, type: :string, description: "Campaign ID"]],
+    request_body:
+      {"Campaign revision", "application/json", Schemas.MailingsCampaign.DeliveryParams},
     responses: %{
       202 =>
         {"Campaign delivery queued", "application/json",
@@ -127,14 +134,20 @@ defmodule KeilaWeb.ApiCampaignController do
     # TODO immediate feedback on missing sender or insufficient credits
     campaign = Mailings.get_project_campaign(project_id(conn), id)
 
-    if campaign do
-      Mailings.deliver_campaign_async(campaign.id)
+    case campaign do
+      nil ->
+        Errors.send_404(conn)
 
-      conn
-      |> put_status(202)
-      |> render("delivery_queued.json", %{campaign: campaign})
-    else
-      Errors.send_404(conn)
+      campaign ->
+        case Mailings.deliver_campaign(campaign.id, conn.body_params.data[:revision]) do
+          :ok ->
+            conn
+            |> put_status(202)
+            |> render("delivery_queued.json", %{campaign: campaign})
+
+          {:error, reason} ->
+            send_campaign_error(conn, reason)
+        end
     end
   end
 
@@ -154,10 +167,14 @@ defmodule KeilaWeb.ApiCampaignController do
 
     if campaign do
       scheduled_for = conn.body_params.data[:scheduled_for]
+      expected_revision = conn.body_params.data[:revision] || campaign.revision
 
-      case Mailings.schedule_campaign(campaign.id, %{scheduled_for: scheduled_for}) do
+      case Mailings.schedule_campaign(campaign.id, %{
+             scheduled_for: scheduled_for,
+             expected_revision: expected_revision
+           }) do
         {:ok, campaign} -> render(conn, "campaign.json", campaign: campaign)
-        {:error, changeset} -> Errors.send_changeset_error(conn, changeset)
+        {:error, reason} -> send_campaign_error(conn, reason)
       end
     else
       Errors.send_404(conn)
@@ -165,4 +182,24 @@ defmodule KeilaWeb.ApiCampaignController do
   end
 
   defp project_id(conn), do: conn.assigns.current_project.id
+
+  defp send_campaign_error(conn, :stale_revision),
+    do: Errors.send_409(conn, "Campaign revision is stale")
+
+  defp send_campaign_error(conn, :immutable_campaign),
+    do: Errors.send_409(conn, "Campaign is immutable")
+
+  defp send_campaign_error(conn, :cannot_unschedule),
+    do: Errors.send_409(conn, "Campaign can no longer be unscheduled")
+
+  defp send_campaign_error(conn, changeset = %Ecto.Changeset{}),
+    do: Errors.send_changeset_error(conn, changeset)
+
+  defp send_campaign_error(conn, reason) do
+    changeset =
+      Ecto.Changeset.change(%Mailings.Campaign{})
+      |> Ecto.Changeset.add_error(:campaign, to_string(reason))
+
+    Errors.send_changeset_error(conn, changeset)
+  end
 end
